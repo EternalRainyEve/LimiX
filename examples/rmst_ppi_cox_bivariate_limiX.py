@@ -1,15 +1,6 @@
 """
 Five-covariate survival simulation with LimiX missing value imputation:
-IPCW, doubly robust, and PPI-Old (Ablation Test)
-2-Fold Cross-Fitting + SEPARATE NUISANCE MODELS FOR EVERY TERM
-
-Run in conda env: limix_test
-  pip install lifelines
-  python examples/rmst_ppi_cox_bivariate_limiX.py --m 5
-
-or:
-  conda run -n limix_test pip install lifelines
-  conda run -n limix_test python examples/rmst_ppi_cox_bivariate_limiX.py --m 1 --n-pre 500 --n-inf 10000
+Strict Original PPI Formula + 2-Fold Cross-Fitting + Separate Nuisance Models
 """
 
 from __future__ import annotations
@@ -26,7 +17,7 @@ import pandas as pd
 import torch
 
 
-# LimiX package root (this file: LimiX/examples/...)
+# LimiX package root
 _LIMIX_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _LIMIX_ROOT not in sys.path:
     sys.path.insert(0, _LIMIX_ROOT)
@@ -38,51 +29,34 @@ IMPUTED_COLS = ["X4", "X5"]
 
 
 # ==============================================================================
-# 1. 数据生成函数 (DGP)
+# 1. 数据生成函数 (DGP) - 保持不变
 # ==============================================================================
 def generate_data(
     n: int,
     rng: np.random.Generator,
     rho: float = 0.7,
     tau: float = 1.4,
-    c_base_hazard: float = 1.05,
-    verbose: bool = True,
+    c_base_hazard: float = 1.05
 ) -> pd.DataFrame:
-    """Explicit Cox PH DGP using Inverse Probability Integral Transform"""
-    # 1. 生成协变量（rho=0.7 提高可填补性；配合默认 n_pre=1000 在 p_label=0.05 时稳定 LimiX）
     cov = np.full((5, 5), rho, dtype=np.float64)
     np.fill_diagonal(cov, 1.0)
     x1, x2, x3, x4, x5 = rng.multivariate_normal(np.zeros(5), cov, size=n).T
 
-    # 2. 显式 Cox PH 生成真实事件时间 T（系数一位小数；X4/X5 略强以体现填补质量）
     beta_t = np.array([-0.5, 0.8, 0.4, 2.1, -1.3])
     risk_score_t = np.exp(
-        beta_t[0] * x1
-        + beta_t[1] * x2
-        + beta_t[2] * x3
-        + beta_t[3] * x4
-        + beta_t[4] * x5
+        beta_t[0] * x1 + beta_t[1] * x2 + beta_t[2] * x3 + beta_t[3] * x4 + beta_t[4] * x5
     )
     
-    nu_t = 2.0  # shape     
-    lambda_t = 1.0  # scale
+    nu_t = 2.0     
+    lambda_t = 1.0  
     u_t = rng.random(n) 
     
     t_true = (-np.log(u_t) / (lambda_t * risk_score_t)) ** (1.0 / nu_t)
     t_trunc = np.minimum(t_true, tau)
-    # 算并打印 85% 分位数（基于 t_true）
-    q85 = np.quantile(t_true, 0.85)
-    if verbose:
-        print(f"85th percentile of t_true: {q85:.4f}")
 
-    # 3. 显式 Cox PH 生成删失时间 C（系数均保留一位小数；X4/X5 较强使 Naive 的 IPCW/DR 更差）
     beta_c = np.array([0.1, 0.2, -0.1, 0.6, -0.5])
     risk_score_c = np.exp(
-        beta_c[0] * x1
-        + beta_c[1] * x2
-        + beta_c[2] * x3
-        + beta_c[3] * x4
-        + beta_c[4] * x5
+        beta_c[0] * x1 + beta_c[1] * x2 + beta_c[2] * x3 + beta_c[3] * x4 + beta_c[4] * x5
     )
     
     nu_c = 1.0
@@ -90,46 +64,31 @@ def generate_data(
     u_c = rng.random(n)
     
     c = (-np.log(u_c) / (lambda_c * risk_score_c)) ** (1.0 / nu_c)
-    q85_c = np.quantile(c, 0.85)
-    if verbose:
-        print(f"85th percentile of c: {q85_c:.4f}")
 
-    # 4. 组装观测数据
     y = np.minimum(t_trunc, c)
     delta = (t_trunc <= c).astype(np.float64)
 
-    return pd.DataFrame(
-        {
-            "X1": x1,
-            "X2": x2,
-            "X3": x3,
-            "X4": x4,
-            "X5": x5,
-            "T_true": t_trunc,
-            "Y": y,
-            "Delta": delta,
-        }
-    )
+    return pd.DataFrame({
+        "X1": x1, "X2": x2, "X3": x3, "X4": x4, "X5": x5,
+        "T_true": t_trunc, "Y": y, "Delta": delta,
+    })
 
 def truth_theta0_rmst(
     rng: np.random.Generator, n_big: int, tau: float
 ) -> tuple[float, float]:
-    d = generate_data(n_big, rng, tau=tau, verbose=False)
+    d = generate_data(n_big, rng, tau=tau)
     censor_rate = 1 - float(d["Delta"].mean())
     return float(d["T_true"].mean()), censor_rate
 
 
 # ==============================================================================
-# 2. 核心辅助函数：极速计算 IPCW 得分与 DR-CUT 得分
+# 2. 核心辅助函数 - 保持不变
 # ==============================================================================
-def _cumulative_baseline_on_grid(
-    cph: CoxPHFitter, grid_t: np.ndarray
-) -> np.ndarray:
+def _cumulative_baseline_on_grid(cph: CoxPHFitter, grid_t: np.ndarray) -> np.ndarray:
     base = cph.baseline_cumulative_hazard_.iloc[:, 0]
     t_bh = base.index.to_numpy(dtype=np.float64)
     h_bh = base.to_numpy(dtype=np.float64)
-    if len(t_bh) == 0:
-        return np.zeros_like(grid_t, dtype=np.float64)
+    if len(t_bh) == 0: return np.zeros_like(grid_t, dtype=np.float64)
     j = np.searchsorted(t_bh, grid_t, side="right") - 1
     h0 = np.empty_like(grid_t, dtype=np.float64)
     neg = j < 0
@@ -137,21 +96,13 @@ def _cumulative_baseline_on_grid(
     h0[~neg] = h_bh[j[~neg]]
     return h0
 
-def _match_r_find_interval(
-    y: np.ndarray, grid_t: np.ndarray, k: int
-) -> np.ndarray:
+def _match_r_find_interval(y: np.ndarray, grid_t: np.ndarray, k: int) -> np.ndarray:
     g = np.sort(np.asarray(grid_t, dtype=np.float64))
     j = np.searchsorted(g, y, side="right")
     j = np.clip(j, 1, k)
     return (j - 1).astype(np.int64)
 
-def compute_scores(
-    newdata: pd.DataFrame,
-    cph_t: CoxPHFitter,
-    cph_c: CoxPHFitter,
-    tau: float,
-    x_cols: List[str],
-) -> dict:
+def compute_scores(newdata: pd.DataFrame, cph_t: CoxPHFitter, cph_c: CoxPHFitter, tau: float, x_cols: List[str]) -> dict:
     n_obs = len(newdata)
     y = newdata["Y"].to_numpy(dtype=np.float64)
     delta = newdata["Delta"].to_numpy(dtype=np.float64)
@@ -167,8 +118,7 @@ def compute_scores(
     h0_t = _cumulative_baseline_on_grid(cph_t, grid_t)
     h0_c = _cumulative_baseline_on_grid(cph_c, grid_t)
     dh0_c = np.empty(k, dtype=np.float64)
-    dh0_c[0] = 0.0
-    dh0_c[1:] = h0_c[1:] - h0_c[:-1]
+    dh0_c[0] = 0.0; dh0_c[1:] = h0_c[1:] - h0_c[:-1]
 
     r_t = cph_t.predict_partial_hazard(newdata[x_cols].astype(np.float64))
     r_c = cph_c.predict_partial_hazard(newdata[x_cols].astype(np.float64))
@@ -218,12 +168,7 @@ def fit_cox_c(frame: pd.DataFrame, x_cols: List[str]) -> CoxPHFitter:
         cph.fit(d, duration_col="Y", event_col="eventC", show_progress=False)
     return cph
 
-def limix_impute_x4x5(
-    pre: pd.DataFrame,
-    inf: pd.DataFrame,
-    predictor: LimiXPredictor,
-    n_anchor: int = 16,
-) -> np.ndarray:
+def limix_impute_x4x5(pre: pd.DataFrame, inf: pd.DataFrame, predictor: LimiXPredictor, n_anchor: int = 16) -> np.ndarray:
     x_train = pre[COVARIATE_COLS].to_numpy(np.float64)
     anchor_y = np.zeros(len(x_train), dtype=np.float64)
 
@@ -232,17 +177,10 @@ def limix_impute_x4x5(
     inf_x = inf[COVARIATE_COLS].to_numpy(np.float64)
     inf_x[:, [COVARIATE_COLS.index(col) for col in IMPUTED_COLS]] = np.nan
 
-    # Anchor rows keep X4/X5 present in the test block, so FilterValidFeatures
-    # does not delete the fully-missing target columns before reconstruction.
     x_test = np.vstack([anchor_x, inf_x])
-    _, reconstructed_x = predictor.predict(
-        x_train,
-        anchor_y,
-        x_test,
-        task_type="Regression",
-    )
+    _, reconstructed_x = predictor.predict(x_train, anchor_y, x_test, task_type="Regression")
     if reconstructed_x is None:
-        raise RuntimeError("LimiX predictor did not return reconstructed_X; set mask_prediction=True.")
+        raise RuntimeError("LimiX predictor failed.")
 
     reconstructed_test = reconstructed_x[-len(x_test):]
     imputed_inf = reconstructed_test[n_anchor:]
@@ -251,7 +189,7 @@ def limix_impute_x4x5(
 
 
 # ==============================================================================
-# 3. 核心单向推断函数 (Cross-Fitting 的单折逻辑：训练与分离)
+# 3. 提取各个独立子集的得分向量 (严格遵循原初 PPI 设定)
 # ==============================================================================
 def compute_fold_theta_separate(
     dt_train: pd.DataFrame, dt_target: pd.DataFrame, tau: float
@@ -259,89 +197,91 @@ def compute_fold_theta_separate(
     
     x_cols = COVARIATE_COLS
     
-    # 布尔索引
     mask_r1_train = dt_train["R"] == 1.0
     mask_r0_train = dt_train["R"] == 0.0
     
     mask_r1_target = dt_target["R"] == 1.0
     mask_r0_target = dt_target["R"] == 0.0
     
-    n_target = len(dt_target)
-    n_r0_target = mask_r0_target.sum()
+    n0_target = mask_r0_target.sum()
+    n1_target = mask_r1_target.sum()
     
-    # -------------------------------------------------------------------------
-    # Baseline 1: Oracle
-    # -------------------------------------------------------------------------
+    # --- Oracle (All Target Data, True X) ---
     cox_t_ora = fit_cox_t(dt_train, x_cols)
     cox_c_ora = fit_cox_c(dt_train, x_cols)
     res_ora = compute_scores(dt_target, cox_t_ora, cox_c_ora, tau, x_cols)
-    theta_ipcw_ora = res_ora["ipcw"].mean()
-    theta_dr_ora = res_ora["dr"].mean()
     
-    # 提前构造好 proxy dataset 用于包含 \hat{X} 的计算
     dt_train_proxy = dt_train.copy()
-    dt_train_proxy["X4"] = dt_train["Xhat4"]
-    dt_train_proxy["X5"] = dt_train["Xhat5"]
+    dt_train_proxy["X4"], dt_train_proxy["X5"] = dt_train["Xhat4"], dt_train["Xhat5"]
     dt_target_proxy = dt_target.copy()
-    dt_target_proxy["X4"] = dt_target["Xhat4"]
-    dt_target_proxy["X5"] = dt_target["Xhat5"]
+    dt_target_proxy["X4"], dt_target_proxy["X5"] = dt_target["Xhat4"], dt_target["Xhat5"]
     
-    # =========================================================================
-    # 核心逻辑：为 PPI 的三项分别拟合完全独立的 Nuisance 模型
-    # =========================================================================
-    
-    # --- Component 1: R=0 样本 ---
-    # Naive 定义等同于 Component 1，即仅用缺失样本！
-    if mask_r0_train.sum() > 0 and mask_r0_target.sum() > 0:
+    # --- Naive (Only R=0 Target Data, ML Imputed X) ---
+    if mask_r0_train.sum() > 0 and n0_target > 0:
         cox_t_r0 = fit_cox_t(dt_train_proxy[mask_r0_train], x_cols)
         cox_c_r0 = fit_cox_c(dt_train_proxy[mask_r0_train], x_cols)
-        res_t1 = compute_scores(dt_target_proxy[mask_r0_target], cox_t_r0, cox_c_r0, tau, x_cols)
-        ppi_t1_ipcw = res_t1["ipcw"].mean()
-        ppi_t1_dr = res_t1["dr"].mean()
+        res_naive = compute_scores(dt_target_proxy[mask_r0_target], cox_t_r0, cox_c_r0, tau, x_cols)
     else:
-        ppi_t1_ipcw, ppi_t1_dr = 0.0, 0.0
-        
-    # Baseline 2: Naive Impute 现在直接复用 Component 1 的结果
-    theta_ipcw_naive = ppi_t1_ipcw
-    theta_dr_naive = ppi_t1_dr
+        res_naive = {"ipcw": np.array([]), "dr": np.array([])}
 
-    # --- Component 2: R=1 带预测值 Xhat4/Xhat5 ---
-    if mask_r1_train.sum() > 0 and mask_r1_target.sum() > 0:
-        cox_t_r1_hat = fit_cox_t(dt_train_proxy[mask_r1_train], x_cols)
-        cox_c_r1_hat = fit_cox_c(dt_train_proxy[mask_r1_train], x_cols)
-        res_t2 = compute_scores(dt_target_proxy[mask_r1_target], cox_t_r1_hat, cox_c_r1_hat, tau, x_cols)
-        ppi_t2_ipcw = res_t2["ipcw"].mean()
-        ppi_t2_dr = res_t2["dr"].mean()
-    else:
-        ppi_t2_ipcw, ppi_t2_dr = 0.0, 0.0
-        
-    # --- Component 3: R=1 带真实值 X4/X5 (Classical) ---
-    if mask_r1_train.sum() > 0 and mask_r1_target.sum() > 0:
+    # --- Classical & Rectifier Term (Only R=1 Target Data) ---
+    if mask_r1_train.sum() > 0 and n1_target > 0:
+        # Classical (True X on R=1)
         cox_t_cla = fit_cox_t(dt_train[mask_r1_train], x_cols)
         cox_c_cla = fit_cox_c(dt_train[mask_r1_train], x_cols)
-        res_cla = compute_scores(dt_target[mask_r1_target], cox_t_cla, cox_c_cla, tau, x_cols)
-        theta_ipcw_class = res_cla["ipcw"].mean()
-        theta_dr_class = res_cla["dr"].mean()
-    else:
-        theta_ipcw_class, theta_dr_class = 0.0, 0.0
+        res_class = compute_scores(dt_target[mask_r1_target], cox_t_cla, cox_c_cla, tau, x_cols)
         
-    # -------------------------------------------------------------------------
-    # 组装 PPI 估计量 (在目标集 target 上进行加权)
-    # -------------------------------------------------------------------------
-    w_0 = n_r0_target / n_target if n_target > 0 else 0.0
-    
-    theta_ipcw_ppi = w_0 * (ppi_t1_ipcw - ppi_t2_ipcw) + theta_ipcw_class
-    theta_dr_ppi = w_0 * (ppi_t1_dr - ppi_t2_dr) + theta_dr_class
+        # ML Imputed X on R=1
+        cox_t_ml1 = fit_cox_t(dt_train_proxy[mask_r1_train], x_cols)
+        cox_c_ml1 = fit_cox_c(dt_train_proxy[mask_r1_train], x_cols)
+        res_ml1 = compute_scores(dt_target_proxy[mask_r1_target], cox_t_ml1, cox_c_ml1, tau, x_cols)
+    else:
+        res_class = {"ipcw": np.array([]), "dr": np.array([])}
+        res_ml1 = {"ipcw": np.array([]), "dr": np.array([])}
     
     return {
-        "ora": np.array([theta_ipcw_ora, theta_dr_ora]),
-        "naive": np.array([theta_ipcw_naive, theta_dr_naive]),
-        "class_": np.array([theta_ipcw_class, theta_dr_class]),
-        "ppi": np.array([theta_ipcw_ppi, theta_dr_ppi]),
+        "ora_ipcw": res_ora["ipcw"], "ora_dr": res_ora["dr"],
+        "naive_ipcw": res_naive["ipcw"], "naive_dr": res_naive["dr"],
+        "class_ipcw": res_class["ipcw"], "class_dr": res_class["dr"],
+        "ml1_ipcw": res_ml1["ipcw"], "ml1_dr": res_ml1["dr"]
     }
 
+
 # ==============================================================================
-# 4. 单次模拟函数 (包含 2-Fold 划分与组合)
+# 评估工具函数：包含 Coverage 和 CI Width 的严格方差计算
+# ==============================================================================
+def calc_metrics_standard(scores: np.ndarray, truth: float) -> tuple[float, float, float]:
+    """For Oracle, Classical, and Naive estimators"""
+    if len(scores) == 0: return 0.0, 0.0, 0.0
+    est = np.mean(scores)
+    var = np.var(scores, ddof=1) / len(scores)
+    se = np.sqrt(var)
+    cov = 1.0 if (est - 1.96 * se) <= truth <= (est + 1.96 * se) else 0.0
+    return est, cov, 2 * 1.96 * se
+
+def calc_metrics_ppi(scores_r0_ml: np.ndarray, scores_r1_true: np.ndarray, scores_r1_ml: np.ndarray, truth: float) -> tuple[float, float, float]:
+    """For Strict Original PPI Estimator"""
+    if len(scores_r0_ml) == 0 or len(scores_r1_true) == 0: return 0.0, 0.0, 0.0
+    
+    n0 = len(scores_r0_ml)
+    n1 = len(scores_r1_true)
+    
+    # 完美对齐用户公式：PPI = Mean(ML on R=0) - Mean(ML on R=1) + Mean(True on R=1)
+    est_naive = np.mean(scores_r0_ml)
+    est_diff = np.mean(scores_r1_true - scores_r1_ml)
+    est_ppi = est_naive + est_diff
+    
+    # 完美对齐 PPI 论文方差公式：Var(Naive)/n0 + Var(True - ML)/n1
+    var_naive = np.var(scores_r0_ml, ddof=1) / n0
+    var_diff = np.var(scores_r1_true - scores_r1_ml, ddof=1) / n1
+    se_ppi = np.sqrt(var_naive + var_diff)
+    
+    cov = 1.0 if (est_ppi - 1.96 * se_ppi) <= truth <= (est_ppi + 1.96 * se_ppi) else 0.0
+    return est_ppi, cov, 2 * 1.96 * se_ppi
+
+
+# ==============================================================================
+# 4. 单次模拟函数 (无缝拼接两折得分)
 # ==============================================================================
 def run_single_sim(
     seed: int,
@@ -350,23 +290,19 @@ def run_single_sim(
     p_label: float,
     tau: float,
     predictor: LimiXPredictor,
+    theta0: float
 ) -> np.ndarray:
     rng = np.random.default_rng(seed)
     
-    # --- Step 1: ML 预测模型 ---
     pre = generate_data(n_pre, rng, tau=tau)
     dt_inf = generate_data(n_inf, rng, tau=tau)
-    
-    # 恢复使用 Bernoulli 分布生成缺失指示变量 R
     r_bern = rng.binomial(1, p_label, size=n_inf).astype(np.float64)
     
     x45_hat = limix_impute_x4x5(pre, dt_inf, predictor)
-
     dt_inf["Xhat4"] = x45_hat[:, 0]
     dt_inf["Xhat5"] = x45_hat[:, 1]
     dt_inf["R"] = r_bern
 
-    # --- Step 2: 将推断集随机均匀分为 A 和 B 两折 ---
     idx_perm = rng.permutation(n_inf)
     split_point = n_inf // 2
     idx_A = idx_perm[:split_point]
@@ -375,41 +311,31 @@ def run_single_sim(
     dt_A = dt_inf.iloc[idx_A].copy()
     dt_B = dt_inf.iloc[idx_B].copy()
 
-    n_A = len(dt_A)
-    n_B = len(dt_B)
-
-    # --- Step 3: 交叉拟合计算 ---
-    # 方向 1: 用 A 作为训练集建立三个独立模型，对 B 进行对应预测和 PPI 聚合
+    # 交叉提取各折 OOF (Out-Of-Fold) 得分
     res_B = compute_fold_theta_separate(dt_A, dt_B, tau)
-
-    # 方向 2: 用 B 作为训练集建立三个独立模型，对 A 进行对应预测和 PPI 聚合
     res_A = compute_fold_theta_separate(dt_B, dt_A, tau)
 
-    # --- Step 4: 加权平均融合结果 ---
-    w_A = n_A / n_inf
-    w_B = n_B / n_inf
+    results = []
+    
+    for metric_type in ["ipcw", "dr"]:
+        # 拼接全量 OOF 得分
+        ora_all = np.concatenate([res_B[f"ora_{metric_type}"], res_A[f"ora_{metric_type}"]])
+        naive_all = np.concatenate([res_B[f"naive_{metric_type}"], res_A[f"naive_{metric_type}"]])
+        class_all = np.concatenate([res_B[f"class_{metric_type}"], res_A[f"class_{metric_type}"]])
+        ml1_all = np.concatenate([res_B[f"ml1_{metric_type}"], res_A[f"ml1_{metric_type}"]])
+        
+        # 依次计算 Oracle, Classical, Naive, PPI
+        results.append(list(calc_metrics_standard(ora_all, theta0)))
+        results.append(list(calc_metrics_standard(class_all, theta0)))
+        results.append(list(calc_metrics_standard(naive_all, theta0)))
+        # 调用专属于原初 PPI 的方差计算函数！
+        results.append(list(calc_metrics_ppi(naive_all, class_all, ml1_all, theta0)))
 
-    est_ora = w_A * res_A["ora"] + w_B * res_B["ora"]
-    est_naive = w_A * res_A["naive"] + w_B * res_B["naive"]
-    est_class = w_A * res_A["class_"] + w_B * res_B["class_"]
-    est_ppi = w_A * res_A["ppi"] + w_B * res_B["ppi"]
+    return np.array(results, dtype=np.float64)
 
-    return np.array(
-        [
-            est_ora[0],   # IPCW_Oracle
-            est_class[0], # IPCW_Classical
-            est_naive[0], # IPCW_Naive
-            est_ppi[0],   # IPCW_PPI
-            est_ora[1],   # DR_Oracle
-            est_class[1], # DR_Classical
-            est_naive[1], # DR_Naive
-            est_ppi[1],   # DR_PPI
-        ],
-        dtype=np.float64,
-    )
 
 # ==============================================================================
-# 环境及模型加载
+# 环境及主程序 (保持不变)
 # ==============================================================================
 def load_or_fetch_ckpt(ckpt: Optional[str], root: str) -> str:
     if ckpt and os.path.isfile(ckpt):
@@ -435,13 +361,13 @@ def resolve_limiX_device(device_arg: str) -> torch.device:
     return torch.device(device_arg)
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Five-covariate survival 2-Fold CF + SEPARATE Models")
-    p.add_argument("--m", type=int, default=50, help="Monte Carlo replicates")
+    p = argparse.ArgumentParser()
+    p.add_argument("--m", type=int, default=50)
     p.add_argument("--seed-gold", type=int, default=999)
     p.add_argument("--theta-n", type=int, default=10_000_000)
     p.add_argument("--n-pre", type=int, default=1000)
     p.add_argument("--n-inf", type=int, default=20000)
-    p.add_argument("--p-label", type=float, default=0.30)
+    p.add_argument("--p-label", type=float, default=0.10)
     p.add_argument("--tau", type=float, default=1.4)
     p.add_argument("--model_path", type=str, default="")
     p.add_argument("--inference_config", type=str, default="")
@@ -453,10 +379,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     root = _LIMIX_ROOT
-    try:
-        os.chdir(root)
-    except OSError:
-        pass
+    try: os.chdir(root)
+    except OSError: pass
     
     rng_g = np.random.default_rng(args.seed_gold)
     theta0, censor_rate = truth_theta0_rmst(rng_g, args.theta_n, args.tau)
@@ -467,48 +391,40 @@ def main() -> None:
     
     dev = resolve_limiX_device(args.device)
     pred = LimiXPredictor(
-        device=dev,
-        model_path=ck,
-        inference_config=icfg,
-        mask_prediction=True,
-        seed=args.predictor_seed,
+        device=dev, model_path=ck, inference_config=icfg, mask_prediction=True, seed=args.predictor_seed,
     )
 
     M = max(1, int(args.m))
     names = [
-        "IPCW_Oracle",
-        "IPCW_Classical",
-        "IPCW_Naive",
-        "IPCW_PPI",
-        "DR_Oracle",
-        "DR_Classical",
-        "DR_Naive",
-        "DR_PPI",
+        "IPCW_Oracle", "IPCW_Classical", "IPCW_Naive", "IPCW_PPI",
+        "DR_Oracle", "DR_Classical", "DR_Naive", "DR_PPI",
     ]
-    res = np.zeros((M, len(names)), dtype=np.float64)
+    
+    res = np.zeros((M, len(names), 3), dtype=np.float64)
+    
     for m2 in range(1, M + 1):
         print(f"replicate {m2}/{M} ...", flush=True)
-        res[m2 - 1, :] = run_single_sim(
-            int(args.base_seed) + m2,
-            n_pre=args.n_pre,
-            n_inf=args.n_inf,
-            p_label=args.p_label,
-            tau=args.tau,
-            predictor=pred,
+        res[m2 - 1, :, :] = run_single_sim(
+            int(args.base_seed) + m2, args.n_pre, args.n_inf, args.p_label, args.tau, pred, theta0
         )
 
-    bias = res.mean(axis=0) - theta0
-    sd = res.std(axis=0, ddof=0)
+    point_ests = res[:, :, 0]
+    bias = point_ests.mean(axis=0) - theta0
+    sd = point_ests.std(axis=0, ddof=1)
     rmse = np.sqrt(bias**2 + sd**2)
+    cov_rate = res[:, :, 1].mean(axis=0)
+    avg_width = res[:, :, 2].mean(axis=0)
     
     out = pd.DataFrame({
         "Method": [f"{i+1}. {n}" for i, n in enumerate(names)],
         "Bias": np.round(bias, 6),
         "SD": np.round(sd, 6),
         "RMSE": np.round(rmse, 6),
+        "Cov Rate": np.round(cov_rate, 4),
+        "Avg Width": np.round(avg_width, 6),
     })
     
-    print(f"\n--- Final Results (2-Fold LimiX MVI + Separate Models(cox)) (M = {M}) ---\n")
+    print(f"\n--- Final Results (Strict Original PPI + 2-Fold CF) (M = {M}) ---\n")
     print(f"missing rate (Expected): {1 - args.p_label}")
     print(f"censor rate: {censor_rate}")
     print(out.to_string(index=False))
