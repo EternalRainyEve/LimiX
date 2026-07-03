@@ -283,30 +283,96 @@ def compute_fold_theta_separate(
         res_t2 = {"ipcw": np.array([]), "dr": np.array([])}
         res_cla = {"ipcw": np.array([]), "dr": np.array([])}
 
-    # 内部辅助函数：计算一折内某个方法对应的点估计和方差
-    def get_stats(arr1, arr2=None):
-        if len(arr1) <= 1: 
-            return 0.0, 0.0
-        est = np.mean(arr1)
-        var = np.var(arr1, ddof=1) / len(arr1)
-        
-        # 如果是 PPI 方法，需要加上 R=1 部分的修正项
-        if arr2 is not None:
-            if len(arr2) > 1:
-                est += np.mean(arr2)
-                var += np.var(arr2, ddof=1) / len(arr2)
+    # ------------------------------------------------------------------
+    # Fold-level point estimates and theorem-based variances
+    # ------------------------------------------------------------------
+    def mean_score_stats(scores: np.ndarray, name: str) -> tuple[float, float]:
+        """
+        For Oracle / Classical / Naive estimators in one target fold.
+
+        Estimator:
+            theta_hat = mean(scores)
+
+        Variance estimator, conditional on the fitted nuisances:
+            Var(theta_hat) = sample_var(scores) / len(scores)
+        """
+        scores = np.asarray(scores, dtype=np.float64)
+        if scores.size <= 1:
+            raise ValueError(f"Not enough target observations to compute variance for {name}: n={scores.size}")
+
+        est = float(np.mean(scores))
+        var = float(np.var(scores, ddof=1) / scores.size)
         return est, var
+
+    def ppi_score_stats(
+        score_r0: np.ndarray,
+        correction_r1: np.ndarray,
+        name: str,
+    ) -> tuple[float, float]:
+        """
+        For PPI estimators in one target fold.
+
+        score_r0:
+            A_i = H(Xhat_i; S_1), evaluated on R=0 target samples.
+
+        correction_r1:
+            B_i = H(X_i; S_3) - H(Xhat_i; S_2), evaluated on R=1 target samples.
+
+        Fold estimator:
+            theta_hat_k = mean(A_i | R=0) + mean(B_i | R=1)
+
+        Theorem-based asymptotic variance of theta_hat_k:
+            Var(theta_hat_k)
+            = [ Var(A_i)/(1 - pi_hat_k) + Var(B_i)/pi_hat_k ] / n_k
+
+        This is algebraically equal to:
+            Var(A_i)/n0_k + Var(B_i)/n1_k
+        where n0_k is the number of R=0 target samples and n1_k is the number of R=1 target samples.
+        """
+        score_r0 = np.asarray(score_r0, dtype=np.float64)
+        correction_r1 = np.asarray(correction_r1, dtype=np.float64)
+
+        n0 = score_r0.size
+        n1 = correction_r1.size
+        n_fold = n0 + n1
+        if n0 <= 1 or n1 <= 1:
+            raise ValueError(
+                f"Not enough target observations to compute PPI variance for {name}: "
+                f"n0={n0}, n1={n1}"
+            )
+
+        est = float(np.mean(score_r0) + np.mean(correction_r1))
+
+        pi_hat = n1 / n_fold
+        s2_r0 = float(np.var(score_r0, ddof=1))
+        s2_corr = float(np.var(correction_r1, ddof=1))
+
+        sigma_hat = s2_r0 / (1.0 - pi_hat) + s2_corr / pi_hat
+        var = sigma_hat / n_fold
+
+        # Equivalent expression:
+        # var = s2_r0 / n0 + s2_corr / n1
+        return est, float(var)
 
     res_dict = {}
     for metric in ["ipcw", "dr"]:
-        # Oracle, Classical, Naive 直接利用自身分数计算均值和方差
-        res_dict[f"ora_{metric}_est"], res_dict[f"ora_{metric}_var"] = get_stats(res_ora[metric])
-        res_dict[f"cla_{metric}_est"], res_dict[f"cla_{metric}_var"] = get_stats(res_cla[metric])
-        res_dict[f"nai_{metric}_est"], res_dict[f"nai_{metric}_var"] = get_stats(res_t1[metric])
-        
-        # PPI 结合了 R=0 (Naive分数) 和 R=1 (Delta分数)
-        delta = res_cla[metric] - res_t2[metric] if len(res_cla[metric]) > 0 else None
-        res_dict[f"ppi_{metric}_est"], res_dict[f"ppi_{metric}_var"] = get_stats(res_t1[metric], delta)
+        # Oracle / Classical / Naive: ordinary mean-score variance in the target fold.
+        res_dict[f"ora_{metric}_est"], res_dict[f"ora_{metric}_var"] = mean_score_stats(
+            res_ora[metric], f"ora_{metric}"
+        )
+        res_dict[f"cla_{metric}_est"], res_dict[f"cla_{metric}_var"] = mean_score_stats(
+            res_cla[metric], f"cla_{metric}"
+        )
+        res_dict[f"nai_{metric}_est"], res_dict[f"nai_{metric}_var"] = mean_score_stats(
+            res_t1[metric], f"nai_{metric}"
+        )
+
+        # PPI: R=0 imputed score plus R=1 correction score.
+        # correction = H(true X; S_3) - H(imputed X; S_2)
+        correction = res_cla[metric] - res_t2[metric]
+        res_dict[f"ppi_{metric}_est"], res_dict[f"ppi_{metric}_var"] = ppi_score_stats(
+            res_t1[metric], correction, f"ppi_{metric}"
+        )
 
     return res_dict
 
