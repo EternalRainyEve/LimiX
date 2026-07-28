@@ -1,0 +1,37 @@
+\section{Real data analysis}
+
+We evaluated the proposed estimators on the SUPPORT2 cohort, a publicly available study of seriously ill hospitalized adults. SUPPORT and SUPPORT2 are standard benchmarks for clinical survival prediction because the cohort contains admission demographics, disease category, comorbidities, functional status, and physiologic/laboratory measurements used in the original SUPPORT prognostic modeling work \cite{knaus1995support,uci_support2,harrell_support2}. A recent reanalysis further emphasized that SUPPORT2 remains a clinically relevant survival-learning benchmark \cite{truong2026support2}. Unlike that fixed-horizon prediction study, which focused on discrimination for 60- and 180-day mortality, our target is the restricted mean survival time (RMST) through $\tau=1000$ days,
+\[
+    \theta_0 = E\{\min(\tilde T,1000)\}.
+\]
+The observed time was $Y=\min(d.time,1000)$, and the truncated outcome was treated as observed when death occurred before 1000 days or when follow-up extended beyond 1000 days. Patients alive and censored before 1000 days were handled through the IPCW and doubly robust scores described above.
+
+Following the original SUPPORT prognostic model and subsequent SUPPORT2 benchmark analyses, we restricted the analysis to baseline variables available at or near study entry and excluded outcome-derived, post-baseline, cost, physician-prognosis, and treatment-limitation variables \cite{knaus1995support,harrell_support2,truong2026support2}. The complete baseline feature set was \(X^1\cup X^2\), the union of the two blocks below. The routinely available block \(X^1\) comprised \texttt{age}, \texttt{num.co}, \texttt{edu}, \texttt{scoma}, \texttt{hday}, \texttt{diabetes}, \texttt{dementia}, \texttt{meanbp}, \texttt{wblc}, \texttt{hrt}, \texttt{resp}, \texttt{temp}, \texttt{pafi}, \texttt{crea}, \texttt{sod}, \texttt{ph}, \texttt{adlsc}, \texttt{sex}, \texttt{race}, \texttt{income}, \texttt{dzgroup}, \texttt{dzclass}, \texttt{ca}, which includes demographic and socioeconomic variables, disease group and disease class, comorbidity indicators, functional status, and baseline physiologic measurements. The costly block \(X^2\) comprised \texttt{bun}, \texttt{glucose}, \texttt{urine}. Numeric missingness in \(X^1\) was median-imputed and categorical missingness was represented as an explicit category, matching common preprocessing practice in SUPPORT2 prediction analyses \cite{truong2026support2}.
+
+To mimic a clinically meaningful costly-covariate setting, we used the renal/metabolic measurement panel
+\[
+    X^2 = \{\log(1+bun), \log(1+glucose), \log(1+urine)\}.
+\]
+Equivalently, the raw costly measurements were $\{\texttt{bun}, \texttt{glucose}, \texttt{urine}\}$. This panel contains blood urea nitrogen, glucose, and urine output, which summarize renal and metabolic status. Because these variables are baseline physiologic measurements and the complete-panel indicator is defined without using survival time, death status, cost variables, physician prognostic estimates, or treatment-limitation variables, we use this panel as a pragmatic approximately MCAR labeled subset for the MCAR-PPI real-data demonstration. We first sampled 1,000 complete-panel patients from the 9,105 SUPPORT2 patients as an external LimiX context set for constructing the imputation rule $f:X^1\mapsto X^2$. These context-set patients were not used in any subsequent estimating equation or nuisance-model fitting. The remaining 8,105 patients formed the inference set. Within this inference set, we defined $R=1$ when all target-panel measurements were observed and $R=0$ otherwise. There were 3,051 complete-panel inference patients ($\hat\pi=37.6\%$), and the censoring fraction before 1000 days was 15.7\%. LimiX used only the external context set to impute $X^2$ for all inference-set patients. We then performed two-fold cross-fitting within the inference set to estimate the survival and censoring nuisance functions and compared the complete-case classical estimator, the naive imputation estimator, and the PPI estimator for both IPCW and doubly robust scores.
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{@{}llcc@{}}
+\toprule
+Est. & Score & RMST (SE) & 95\% CI \\
+\midrule
+Class. & IPCW & 696.3 (79.4) & [540.6, 852.0] \\
+Class. & DR & 445.1 (7.9) & [429.5, 460.6] \\
+Naive & IPCW & 451.1 (9.4) & [432.7, 469.6] \\
+Naive & DR & 441.8 (4.8) & [432.3, 451.3] \\
+PPI & IPCW & 428.8 (28.1) & [373.6, 483.9] \\
+PPI & DR & 435.7 (6.2) & [423.6, 447.9] \\
+\bottomrule
+\end{tabular}
+\caption{SUPPORT2 real-data RMST estimates at $\tau=1000$ days.}
+\label{tab:support2-rmst}
+\end{table}
+
+This analysis uses the same MCAR-PPI correction form as the simulations for comparability with the theory. Since SUPPORT2 is an observational registry rather than a randomized audit of laboratory collection, exact MCAR cannot be verified from the data alone. We therefore interpret the complete-panel indicator as an approximately MCAR working design for evaluating the proposed costly-covariate workflow; a propensity-adjusted PPI extension with estimated $P(R=1\mid X^1)$ is a natural direction for future work.
