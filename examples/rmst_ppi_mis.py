@@ -163,6 +163,279 @@ def truth_theta0_rmst(
 
     return float(d["T_true"].mean()), censoring_rate
 
+# ==============================================================================
+# 1. DGP: S^T misspecified, S^C correctly specified
+# ==============================================================================
+def generate_data(
+    n: int,
+    rng: np.random.Generator,
+    tau: float,
+    rho: float = 0.7,
+    c_base_hazard: float = 0.23,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """
+    Failure-time model S^T is misspecified.
+    Censoring model S^C is correctly specified.
+
+    The true failure-time model contains nonlinear and interaction terms,
+    while the working Cox model contains only linear main effects.
+    """
+
+    cov = np.full((5, 5), rho, dtype=np.float64)
+    np.fill_diagonal(cov, 1.0)
+
+    x1, x2, x3, x4, x5 = rng.multivariate_normal(
+        np.zeros(5),
+        cov,
+        size=n,
+    ).T
+
+    # --------------------------------------------------------------------------
+    # Failure-time model: misspecified
+    # --------------------------------------------------------------------------
+    beta_t = np.array([-0.5, 0.8, 0.4, 2.1, -1.3])
+
+    linear_predictor_t = (
+        beta_t[0] * x1
+        + beta_t[1] * x2
+        + beta_t[2] * x3
+        + beta_t[3] * x4
+        + beta_t[4] * x5
+    )
+
+    # Centered nonlinear term:
+    # E(X1^2 - 1) = 0
+    # E(X2 X4 - rho) = 0
+    # E(X3 X5 - rho) = 0
+    q_t = (
+        0.6 * (x1**2 - 1.0)
+        + 0.5 * (x2 * x4 - rho)
+        - 0.5 * (x3 * x5 - rho)
+    )
+
+    misspec_strength = 0.5
+    linear_predictor_t = (
+        linear_predictor_t
+        + misspec_strength * q_t
+    )
+
+    risk_score_t = np.exp(linear_predictor_t)
+
+    nu_t = 2.0
+    lambda_t = 1.0
+    u_t = rng.random(n)
+
+    t_true = (
+        -np.log(u_t) / (lambda_t * risk_score_t)
+    ) ** (1.0 / nu_t)
+
+    t_trunc = np.minimum(t_true, tau)
+
+    if verbose:
+        q85 = np.quantile(t_true, 0.85)
+        print(f"85th percentile of t_true: {q85:.4f}")
+
+    # --------------------------------------------------------------------------
+    # Censoring model: correctly specified
+    # --------------------------------------------------------------------------
+    beta_c = np.array([0.1, 0.2, -0.1, 0.6, -0.5])
+
+    linear_predictor_c = (
+        beta_c[0] * x1
+        + beta_c[1] * x2
+        + beta_c[2] * x3
+        + beta_c[3] * x4
+        + beta_c[4] * x5
+    )
+
+    risk_score_c = np.exp(linear_predictor_c)
+
+    nu_c = 1.0
+    lambda_c = c_base_hazard
+    u_c = rng.random(n)
+
+    c = (
+        -np.log(u_c) / (lambda_c * risk_score_c)
+    ) ** (1.0 / nu_c)
+
+    if verbose:
+        q85_c = np.quantile(c, 0.85)
+        print(f"85th percentile of c: {q85_c:.4f}")
+
+    y = np.minimum(t_trunc, c)
+    delta = (t_trunc <= c).astype(np.float64)
+
+    return pd.DataFrame(
+        {
+            "X1": x1,
+            "X2": x2,
+            "X3": x3,
+            "X4": x4,
+            "X5": x5,
+            "T_true": t_trunc,
+            "Y": y,
+            "Delta": delta,
+        }
+    )
+
+
+def truth_theta0_rmst(
+    rng: np.random.Generator,
+    n_big: int,
+    tau: float,
+) -> tuple[float, float]:
+    d = generate_data(
+        n=n_big,
+        rng=rng,
+        tau=tau,
+        verbose=False,
+    )
+
+    censoring_rate = 1.0 - float(d["Delta"].mean())
+
+    return float(d["T_true"].mean()), censoring_rate
+
+
+# ==============================================================================
+# 1. DGP: both S^T and S^C misspecified
+# ==============================================================================
+def generate_data(
+    n: int,
+    rng: np.random.Generator,
+    tau: float,
+    rho: float = 0.7,
+    c_base_hazard: float = 0.23,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """
+    Both the failure-time model S^T and censoring model S^C are misspecified.
+
+    Both true models contain nonlinear and interaction terms, while the
+    working Cox models contain only linear main effects.
+    """
+
+    cov = np.full((5, 5), rho, dtype=np.float64)
+    np.fill_diagonal(cov, 1.0)
+
+    x1, x2, x3, x4, x5 = rng.multivariate_normal(
+        np.zeros(5),
+        cov,
+        size=n,
+    ).T
+
+    # --------------------------------------------------------------------------
+    # Failure-time model: misspecified
+    # --------------------------------------------------------------------------
+    beta_t = np.array([-0.5, 0.8, 0.4, 2.1, -1.3])
+
+    linear_predictor_t = (
+        beta_t[0] * x1
+        + beta_t[1] * x2
+        + beta_t[2] * x3
+        + beta_t[3] * x4
+        + beta_t[4] * x5
+    )
+
+    q_t = (
+        0.6 * (x1**2 - 1.0)
+        + 0.5 * (x2 * x4 - rho)
+        - 0.5 * (x3 * x5 - rho)
+    )
+
+    misspec_strength = 0.5
+    linear_predictor_t = (
+        linear_predictor_t
+        + misspec_strength * q_t
+    )
+
+    risk_score_t = np.exp(linear_predictor_t)
+
+    nu_t = 2.0
+    lambda_t = 1.0
+    u_t = rng.random(n)
+
+    t_true = (
+        -np.log(u_t) / (lambda_t * risk_score_t)
+    ) ** (1.0 / nu_t)
+
+    t_trunc = np.minimum(t_true, tau)
+
+    if verbose:
+        q85 = np.quantile(t_true, 0.85)
+        print(f"85th percentile of t_true: {q85:.4f}")
+
+    # --------------------------------------------------------------------------
+    # Censoring model: misspecified
+    # --------------------------------------------------------------------------
+    beta_c = np.array([0.1, 0.2, -0.1, 0.6, -0.5])
+
+    linear_predictor_c = (
+        beta_c[0] * x1
+        + beta_c[1] * x2
+        + beta_c[2] * x3
+        + beta_c[3] * x4
+        + beta_c[4] * x5
+    )
+
+    q_c = (
+        0.6 * (x4**2 - 1.0)
+        - 0.5 * (x1 * x5 - rho)
+        + 0.5 * (x2 * x3 - rho)
+    )
+
+    linear_predictor_c = (
+        linear_predictor_c
+        + misspec_strength * q_c
+    )
+
+    risk_score_c = np.exp(linear_predictor_c)
+
+    nu_c = 1.0
+    lambda_c = c_base_hazard
+    u_c = rng.random(n)
+
+    c = (
+        -np.log(u_c) / (lambda_c * risk_score_c)
+    ) ** (1.0 / nu_c)
+
+    if verbose:
+        q85_c = np.quantile(c, 0.85)
+        print(f"85th percentile of c: {q85_c:.4f}")
+
+    y = np.minimum(t_trunc, c)
+    delta = (t_trunc <= c).astype(np.float64)
+
+    return pd.DataFrame(
+        {
+            "X1": x1,
+            "X2": x2,
+            "X3": x3,
+            "X4": x4,
+            "X5": x5,
+            "T_true": t_trunc,
+            "Y": y,
+            "Delta": delta,
+        }
+    )
+
+
+def truth_theta0_rmst(
+    rng: np.random.Generator,
+    n_big: int,
+    tau: float,
+) -> tuple[float, float]:
+    d = generate_data(
+        n=n_big,
+        rng=rng,
+        tau=tau,
+        verbose=False,
+    )
+
+    censoring_rate = 1.0 - float(d["Delta"].mean())
+
+    return float(d["T_true"].mean()), censoring_rate
+
 
 # ==============================================================================
 # 2. core functions: fast computation of IPCW and DR-CUT scores
